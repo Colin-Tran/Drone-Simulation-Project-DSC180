@@ -19,10 +19,15 @@ from isaaclab.cli import load_external_tasks
 
 from isaaclab_tasks.utils import resolve_task_config
 
+from IsaacLab_Drone_Project.controllers.cascaded_pid import CascadedPID, CascadedPIDCfg
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=250)
+    parser.add_argument("--controller", choices=("lee", "pid"), default="lee")
+    parser.add_argument("--yaw-target", choices=("zero", "initial"), default="zero")
+    parser.add_argument("--target-offset", type=float, nargs=3, default=(0.0, 0.0, 0.0))
     parser.add_argument("--decimation", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log", type=Path, default=None)
@@ -108,6 +113,9 @@ def main():
             device=device,
         )
         controller.reset()
+        if args.controller == "pid":
+            controller_cfg = CascadedPIDCfg()
+            controller = CascadedPID(controller.mass, controller.gravity, env_cfg.sim.dt * env_cfg.decimation, controller_cfg)
         actuator = robot.actuators["thrusters"]
         startup_thrust = actuator.curr_thrust[0].clone()
         print("Configured default rps:", robot.data.default_thruster_rps.tolist())
@@ -126,7 +134,7 @@ def main():
         print("Initial motor thrust (N):", actuator.curr_thrust[0].tolist())
         print("Rise/fall tau (s):", actuator.tau_inc_s.tolist(), actuator.tau_dec_s.tolist())
         assert math.isclose(actuator.cfg.dt, env_cfg.sim.dt)
-        log_path = args.log or Path("outputs") / (datetime.now().strftime("lee_hover_%Y%m%d_%H%M%S_%f") + ".jsonl")
+        log_path = args.log or Path("outputs") / (args.controller + datetime.now().strftime("_hover_%Y%m%d_%H%M%S_%f") + ".jsonl")
         log_path.parent.mkdir(parents=True, exist_ok=True)
         print("Diagnostics:", log_path.resolve())
 
@@ -134,12 +142,16 @@ def main():
         # with a desired yaw of zero.
         initial_pos = robot.data.root_pos_w.torch[0].clone()
         target = torch.cat([initial_pos, initial_pos.new_zeros(1)]).unsqueeze(0)
+        target[:, :3] += target.new_tensor(args.target_offset)
+        if args.yaw_target == "initial":
+            qw, qx, qy, qz = robot.data.root_quat_w.torch[0]
+            target[:, 3] = torch.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
 
         # Matrix rows: [Fz, Tx, Ty, Tz]
         # Columns: [BL, BR, FL, FR]
         mixer = robot.allocation_matrix[2:6, :]
 
-        print("\n=== LEE HOVER TEST ===")
+        print(f"\n=== {args.controller.upper()} HOVER TEST ===")
         print("Target:", target[0].tolist())
         print("Motor order:", robot.thruster_names)
         print("======================\n")
@@ -152,6 +164,8 @@ def main():
                             "physics_dt": env_cfg.sim.dt,
                             "decimation": args.decimation,
                             "seed": args.seed,
+                            "controller": args.controller,
+                            "yaw_target": args.yaw_target,
                             "target": target[0].tolist(),
                             "allocation_matrix": robot.allocation_matrix.tolist(),
                             "mass": controller.mass.tolist(),
@@ -173,7 +187,13 @@ def main():
             )
             for step in range(args.steps):
                 # Compute required forces and torques.
-                wrench = controller.compute(target)
+                if args.controller == "pid":
+                    wrench = controller.compute(
+                        target, robot.data.root_pos_w.torch, robot.data.root_lin_vel_w.torch,
+                        robot.data.root_quat_w.torch, robot.data.root_ang_vel_b.torch,
+                    )
+                else:
+                    wrench = controller.compute(target)
 
                 # Convert Fz, Tx, Ty, Tz into 4 motor thrusts.
                 motor_thrusts = torch.linalg.solve(mixer, wrench[0, 2:6])
@@ -181,6 +201,8 @@ def main():
                 # Stay within the configured motor command limits.
                 raw_thrusts = motor_thrusts.clone()
                 motor_thrusts = motor_thrusts.clamp(0.0, 6.0)
+                if args.controller == "pid":
+                    controller.allocation_feedback(raw_thrusts.unsqueeze(0), motor_thrusts.unsqueeze(0))
                 # Capture pre-action state: env.step auto-resets on termination.
                 record = {
                     "step": step,
